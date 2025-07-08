@@ -1,15 +1,16 @@
 ### Amazon Lambda implementation for Fluent Support Email Piping
-This repo is an update to the original WPManageNinja/fluent-support-email-parser
+This repo is an update to the original WPManageNinja/fluent-support-email-parser. The original was unmaintained
+and had no real documentation on how to implement it.
 
-## What's changed:
-- Actual documentation on how to use this.
-- Uses node version 22, instead of 14.
-- Uses aws sdk 3, it's much faster and lighter.
+## What's changed from the original:
+- Usable documentation on how to use the code.
+- Proper testing usual actual configuration data.
+- Uses node version 22, upgrade 14.
+- Uses aws sdk 3. Make it much lighter which results in faster startup time, this makes it cheaper to use.
 - Handles multiple domains.
 - Implements authentication to WordPress.
 - Better error handling.
-- IAM Access that follows the Principle of Least Privilege.
-- Added robust testing, ability to confirm your configuration before deployment.
+- IAM Access that follows the principle of least privilege.
 
 ![Diagram flow: Email->SES->S3 Bucket->Lamba Function->WordPress](images/diagram.png)
 
@@ -27,7 +28,7 @@ This repo is an update to the original WPManageNinja/fluent-support-email-parser
 
 ## Setup Steps
 
-### AWS - SE
+### AWS - SES
 - Setup SES with inbound email handling:
   - Create a SES verified Domain but do not setup the "Rule Set", you'll do this later.
   - Verify that your endpoint is in an AWS Region that supports email receiving: https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_inbound_endpoints
@@ -35,7 +36,7 @@ This repo is an update to the original WPManageNinja/fluent-support-email-parser
   - Add a mail exchanger record (MX record) to your domain's DNS configuration: https://docs.aws.amazon.com/ses/latest/dg/receiving-email-mx-record.html
     - You can use any DNS provider, not just AWS.
 
-## Local Environment
+## Local Machine
 - On your local machine, install and configure aws command line tools.
 - Install NodeJS, version 22.
 - Install serverless command line tools.
@@ -60,7 +61,10 @@ An example, if my WordPress site was at https://example.com:
 aws ssm put-parameter --name "/fluent-support/example-com-pass" --value "abcd 1234 efgh 5678 ijkl 9012" --type SecureString
 ```
 
-## Local Environment - Continued
+Tp update the ssm, you can run this again, or use the AWS Console, and go tinto the `Systems Manager` area, under
+`Application Tools`, select `Parameter Store`.
+
+## Local Machine - Continued
 
 - Navigate to your local copy of this repository.
 - run `npm install`
@@ -72,7 +76,7 @@ aws ssm put-parameter --name "/fluent-support/example-com-pass" --value "abcd 12
     - It's important to make sure the bucket name starts with an uppercase letter after `S3Bucket`.
   - Line number 23+: For each domain you support, you must add a unique set of environment variables for the username
     and password. The keys (e.g., `EXAMPLE_COM_USER`) must be unique per domain. See `mappers.js` file for hints.
-- If you change the region check if SES receiving exists in your region
+- If you change the region, check if SES receiving exists in your region
 - Edit `mappers.js`:
   - You'll need to items to both `domainCredentials` and `getChannel`.
     - `domainCredentials`: For every domain, you'll need to create an entry to fetch the API credentials.
@@ -93,14 +97,13 @@ Or to deploy to production:
 serverless deploy --stage production
 ```
 
-
 There's not much difference between the two and both are functional. Dev has additional logging to CloudWatch. This
 may incur additional usage fees for both lambda runtime and CloudWatch storage. Recommendation: deploy to dev,
 test it out. After a few days, weeks, etc, then 'serverless remove' and then deploy production.
 
 **Don't** go poking around AWS until the deployment is complete. Be patient.
 
-## AWS - SES Continuted
+## AWS - SES Continued
 Setup SES Email Receiving Rule**
 
 1) Open the Amazon SES console at https://console.aws.amazon.com/ses/
