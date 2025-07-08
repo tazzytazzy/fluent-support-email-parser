@@ -1,4 +1,4 @@
-Delivered-To: your_own_masked_email@domain.com
+Delivered-To: TEST_EMAIL_ADDRESS
 Received: by 2002:a05:6520:1088:b0:220:3a69:1aa5 with SMTP id cb8csp99186lkb;
         Thu, 13 Oct 2022 17:13:43 -0700 (PDT)
 X-Received: by 2002:a63:7909:0:b0:458:1ba6:ec80 with SMTP id u9-20020a637909000000b004581ba6ec80mr2200261pgc.414.1665706423721;
@@ -71,7 +71,7 @@ MIME-Version: 1.0
 Date: Thu, 13 Oct 2022 17:13:42 -0700
 Message-ID: <CAAJCmvZJYU=gEvuxmuWKDsE5m1h3sVRDkUy8g6admPu=QxQ01w@mail.gmail.com>
 Subject: [Fluent Support] Some plugins were automatically updated
-To: your_own_masked_email@domain.com
+To: TEST_EMAIL_ADDRESS
 Content-Type: text/plain; charset="UTF-8"
 
 Howdy! Some plugins have automatically updated to their latest

@@ -1,20 +1,55 @@
-service: aws-node-ses-fluentsupport-pipe
-
-frameworkVersion: ">=1.1.0"
+service: node-ses-fluentsupport-pipe
 
 custom:
-  bucket: sesfluentsupportprod # Change this with your amazon ses bucket name. Do not create the bucket manually, it will be created automatically
-  bucketRef: S3BucketSesfluentsupportprod # just change this with any valid uniqe name
+  # Choose a globally unique S3 bucket name for receiving emails.
+  # -- lowercase -- !!
+  bucket: myinboundfluentsupportbucket
+
+  # This is a Serverless Framework resource reference.
+  # Convention: 'S3Bucket' + your bucket name from above.
+  # E.g., if bucket is 'my-bucket', this would be 'S3BucketMyBucket'.
+  bucketRef: S3BucketMyinboundfluentsupportbucket
 
 provider:
   name: aws
-  runtime: nodejs14.x
-  region: us-east-1
-  iamRoleStatements:
-    - Effect: Allow
-      Action:
-        - s3:*
-      Resource: "*"
+  runtime: nodejs22.x
+  region: us-west-1
+
+  # Provide secrets and config to your function as environment variables.
+  # For production, these values are fetched securely from AWS SSM Parameter Store.
+  environment:
+    STAGE: ${opt:stage, 'dev'} # Default is always dev, unless '--stage' was used during deployment.
+    S3_ATTACHMENT_BUCKET: ${self:custom.bucket} # References the bucket from above
+    # For each domain
+  EXAMPLE_COM_USER: 'WordPressUsername'
+  EXAMPLE_COM_PASS: "${ssm:/fluent-support/example-com-pass}"
+  ANOTHEREXAMPLE_COM_USER: 'WordPressUsername'
+  ANOTHEREXAMPLE_COM_PASS: "${ssm:/fluent-support/anotherexample-com-pass}"
+
+  memorySize: 256  # Max Ram: 121mb. 256MB=1120mm runtime, 384mb=960ms, 1024=520ms. Cheaper to use 256
+
+  iam:
+    role:
+      statements:
+        # Permission to read the incoming email from the SES trigger bucket
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource: "arn:aws:s3:::${self:custom.bucket}/*"
+        # Permissions to manage attachments in the attachments bucket
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject # Required for creating presigned URLs
+          Resource: "arn:aws:s3:::${self:provider.environment.S3_ATTACHMENT_BUCKET}/*"
+        # Permission for the Lambda to fetch secrets from SSM at runtime if ever needed
+        # Note: The user/role running 'serverless deploy' also needs these permissions.
+        - Effect: Allow
+          Action:
+            - ssm:GetParameters
+            - ssm:GetParameter
+          Resource:
+            - "arn:aws:ssm:${aws:region}:${aws:accountId}:parameter/fluent-support/*"
 
 functions:
   postprocess:
@@ -29,17 +64,17 @@ resources:
     S3EMailBucketPermissions:
       Type: AWS::S3::BucketPolicy
       Properties:
-        Bucket: 
+        Bucket:
           Ref: ${self:custom.bucketRef}
         PolicyDocument:
           Statement:
-            - Principal: 
+            - Principal:
                 Service: "ses.amazonaws.com"
               Action:
                 - s3:PutObject
               Effect: Allow
               Sid: "AllowSESPuts"
-              Resource: 
+              Resource:
                 Fn::Join: ['', ['arn:aws:s3:::', Ref: "${self:custom.bucketRef}", '/*'] ]
               Condition:
                 StringEquals:

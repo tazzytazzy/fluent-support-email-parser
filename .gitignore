@@ -1,3 +1,10 @@
-node_modules
-.serverless
+# .gitignore
 .idea
+
+# Dependencies
+/node_modules
+
+# Serverless Framework specific files
+.serverless/
+.env
+!.env-example

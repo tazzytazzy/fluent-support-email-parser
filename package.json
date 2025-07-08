@@ -5,10 +5,20 @@
   "author": "Andreas Heissenberger <andreas@heissenberger.at>, Shahjahan Jewel",
   "license": "MIT",
   "dependencies": {
-    "aws-sdk": "^2.1232.0",
-    "axios": "^0.21.1",
-    "email-reply-parser": "^1.2.6",
-    "mailparser": "^2.3.4",
-    "turndown": "^7.1.1"
+    "@aws-sdk/client-s3": "^3.842.0",
+    "@aws-sdk/s3-request-presigner": "^3.842.0",
+    "axios": "^1.7.4",
+    "email-reply-parser": "^1.8.0",
+    "mailparser": "^3.7.1",
+    "turndown": "^7.2.0"
+  },
+  "scripts": {
+    "test": "mocha"
+  },
+  "devDependencies": {
+    "chai": "^5.2.0",
+    "dotenv": "^17.0.1",
+    "mocha": "^11.7.1",
+    "sinon": "^21.0.0"
   }
 }

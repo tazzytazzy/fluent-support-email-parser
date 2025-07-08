@@ -1,162 +1,122 @@
 'use strict';
 
+// Use dotenv to load local environment variables from a .env file
+require('dotenv').config();
+
+// Use both sync and async fs for different purposes in the test file
 const fs = require('fs');
-const AWS = require('aws-sdk');
+const fsp = require('fs').promises;
+const path = require('path');
+const { Readable } = require('stream');
+
+// Import testing libraries
+const sinon = require('sinon');
+const { expect } = require('chai');
+
+// Import the handler and its dependencies
+const handler = require('./handler');
+const { domainCredentials, domainCredentialConfig } = require('./mappers');
 const axios = require('axios');
-const EmailReplyParser = require("email-reply-parser");
-const TurndownService = require("turndown");
-const turndownService = new TurndownService();
-const {getChannel} = require("./mappers");
-const simpleParser = require('mailparser').simpleParser;
-const MailParser = require('mailparser').MailParser;
+const { S3Client } = require('@aws-sdk/client-s3');
 
-const s3 = new AWS.S3({
-    apiVersion: '2006-03-01',
-    region: process.env.AWSREGION,
-});
-
-const s3AttachmentBucketName = ''; // This need to unique
-
-function parseEmailTo(data) {
-    return data.value[0];
+/**
+ * Generates dynamic mime content for testing by replacing placeholders.
+ * @param {string} emailAddress - The email address to inject into the mime file.
+ * @returns {Promise<Buffer>} A buffer containing the modified mime content.
+ */
+async function generateMimeContent(emailAddress) {
+    const mimeTemplatePath = path.join(__dirname, 'test_assets', 'sample_in');
+    const template = await fsp.readFile(mimeTemplatePath, 'utf-8');
+    const modifiedContent = template.replace(/TEST_EMAIL_ADDRESS/g, emailAddress);
+    return Buffer.from(modifiedContent);
 }
 
-function getNow() {
-    const date = new Date();
-    return date.getFullYear() + '-' + (date.getMonth() + 1) + '-' + date.getDate() + ' ' + date.getHours() + ':' + date.getMinutes() + ':' + date.getSeconds();
-}
+/**
+ * An integration test suite for the postprocess Lambda handler.
+ * It is dynamically configured via the .env file.
+ */
+describe('Email Processing Handler', () => {
+    let s3Stub;
+    let axiosStub;
 
-fs.readFile('sample_mimes/sample', async function (err, data) {
-
-    try {
-        // console.log('Raw email:' + data.Body);
-        const email = await simpleParser(data);
-
-        const to = parseEmailTo(email.to);
-        const mimeName = 'sample';
-
-        const webhookUrl = getChannel(to.address, email.headers.get('x-forwarded-to'));
-
-        if (!webhookUrl) {
-            console.log('No Webhook URL found for email Mime: ' + mimeName + '; Email Address: ' + to.address);
-            return false; // Webhook URL could not be found from your mappers.js file
+    // Before running tests, do a pre-flight check of the .env configuration
+    before(() => {
+        const envPath = path.join(__dirname, '.env');
+        if (!fs.existsSync(envPath)) {
+            throw new Error(`FATAL: .env file not found. Please copy .env-example to .env and fill it out before running tests.`);
         }
 
-        const now = getNow();
-        let isMarkDown = false;
+        // 1. Start with the static variables required for any test run.
+        const staticVars = ['TEST_EMAIL_ADDRESS', 'TEST_EXPECTED_WEBHOOK_URL'];
 
-        if (!email.text && email.html) {
+        // 2. Dynamically get all credential variable names from the mapper config.
+        const dynamicCredentialVars = Object.values(domainCredentialConfig)
+            .flatMap(config => [config.userVar, config.passVar]);
 
-            const head = email.html.match(/<head>.*<\/head>/s);
-            if (head) {
-                email.html = email.html.replace(head[0], '');
-            }
+        // 3. Combine them into the full list of required variables.
+        const requiredVars = [...staticVars, ...dynamicCredentialVars];
 
-            email.text = turndownService.turndown(email.html);
-            isMarkDown = true;
+        const missingVars = requiredVars.filter(v => !process.env[v]);
+        if (missingVars.length > 0) {
+            throw new Error(`FATAL: Missing required environment variables in .env file for testing: ${missingVars.join(', ')}`);
         }
+    });
 
-        const emailReplyParser = new EmailReplyParser().read(email.text);
-        let visibleText = emailReplyParser.getVisibleText();
+    // Before each test, set up the stubs
+    beforeEach(() => {
+        s3Stub = sinon.stub(S3Client.prototype, 'send');
+        axiosStub = sinon.stub(axios, 'post');
+    });
 
-        // Handle Forwarded Message
-        const matches = visibleText.match(/From:.+?(?=To:)[^>]*>/sg);
-        let forwarded = null;
-        if (matches) {
-            let forwardedParts = visibleText.match(/(?<=From:\s+)(.*?)(?=>)/);
-            if (forwardedParts) {
-                forwardedParts = forwardedParts[0].split('<');
-                forwarded = {
-                    name: forwardedParts[0].trim(),
-                    address: forwardedParts[1].trim()
-                };
-            }
+    // After each test, restore the original methods
+    afterEach(() => {
+        sinon.restore();
+    });
 
-            matches.forEach(match => visibleText = visibleText.replace(match, ''));
-            visibleText = visibleText.replace(/---------- Forwarded message ---------/g, '');
-        }
-
-        const formattedData = {
-            date: email.date,
-            subject: email.subject,
-            body_text: (new MailParser()).textToHtml(visibleText),
-            messageId: email.messageId,
-            from: email.from,
-            to: email.to,
-            forwarded,
-            attachments: [],
-            isMarkDown
+    it('should parse a sample email and post the correct payload to the webhook', async () => {
+        // --- 1. Setup the Test ---
+        const mimeContent = await generateMimeContent(process.env.TEST_EMAIL_ADDRESS);
+        const mockS3Event = {
+            Records: [{
+                s3: {
+                    bucket: { name: 'fluentsupportinboundemail' },
+                    object: { key: 'test-email-key' },
+                },
+            }, ],
         };
 
-        const processPayload = async _ => {
-            if(false) { // Attachment will not wok on test payload
-                for (let i = 0; i < email.attachments.length; i++) {
-                    const attachment = email.attachments[i];
-                    const key = attachment.filename.split('.').join('_' + Date.now() + '.');
+        s3Stub.resolves({ Body: Readable.from(mimeContent) });
+        axiosStub.resolves({ status: 200, data: { message: 'Payload received' } });
 
-                    await s3.putObject({
-                        Bucket: s3AttachmentBucketName,
-                        Key: key,
-                        Body: attachment.content
-                    }).promise();
+        // --- 2. Execute the Handler ---
+        console.log(`--- Calling handler.postprocess for email: ${process.env.TEST_EMAIL_ADDRESS} ---`);
+        await handler.postprocess(mockS3Event);
+        console.log('--- Handler execution finished ---');
 
-                    await s3.getSignedUrlPromise('getObject', {
-                        Bucket: s3AttachmentBucketName,
-                        Key: key,
-                    }).then(url => {
-                        formattedData.attachments.push({
-                            url,
-                            cid: attachment.cid,
-                            filename: attachment.filename,
-                            contentType: attachment.contentType,
-                            contentDisposition: attachment.contentDisposition,
-                        });
-                    })
-                }
-            }
+        // --- 3. Assert the Results ---
+        console.log('--- Verifying results ---');
 
-            const postedData = JSON.stringify(formattedData);
+        expect(axiosStub.calledOnce).to.be.true;
+        const [url, payload, config] = axiosStub.getCall(0).args;
 
-            await axios.post(webhookUrl, {payload: postedData})
-                .then((res) => {
-                    if(res.data && res.data.type) {
-                        console.log(res.data.type);
-                        // this is a success
-                    } else {
-                        // this maybe an error from remote server
-                        console.log('Unexpected Data Received from remote Server')
-                        console.log(res.data);
-                    }
-                })
-                .catch((error) => {
-                    let log = {
-                        type: 'failed',
-                        payload: postedData,
-                        mime: mimeName,
-                        created_at: now,
-                        updated_at: now
-                    };
+        // Assert against the expected webhook URL from .env
+        const expectedUrl = process.env.TEST_EXPECTED_WEBHOOK_URL;
+        expect(url).to.equal(expectedUrl);
+        console.log(`✅ Correct webhook URL was called: ${url}`);
 
-                    if (error.response) {
-                        log.response_status = error.response.status;
-                        log.message = 'Probably plugin deactivated.';
-                    } else if (error.request) {
-                        log.response_status = 400;
-                        log.message = 'Domain not available.';
-                    } else {
-                        log.response_status = 500;
-                        log.message = 'Axios setup error.';
-                    }
+        // Dynamically find the correct credentials to assert against
+        const domain = new URL(expectedUrl).hostname;
+        const domainCreds = domainCredentials[domain];
+        expect(domainCreds, `Credentials for domain '${domain}' not found in mappers.js`).to.exist;
 
-                    console.log(log);
-                })
-                .finally(() => {});
-        }
+        const expectedCredentials = Buffer.from(`${domainCreds.username}:${domainCreds.password}`).toString('base64');
+        expect(config.headers.Authorization).to.equal(`Basic ${expectedCredentials}`);
+        console.log(`✅ Authorization header is correct for domain: ${domain}`);
 
-        await processPayload();
+        const parsedPayload = JSON.parse(payload.payload);
+        expect(parsedPayload.subject).to.equal('[Fluent Support] Some plugins were automatically updated');
+        console.log(`✅ Parsed subject is correct: "${parsedPayload.subject}"`);
 
-    } catch (Error) {
-        console.log(Error, Error.stack);
-        return Error;
-    }
+        console.log('\n✅ Test passed successfully!');
+    });
 });

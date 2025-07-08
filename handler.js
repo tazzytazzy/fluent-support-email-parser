@@ -1,160 +1,171 @@
 'use strict';
 
-const AWS = require('aws-sdk');
+// AWS SDK v3 is modular. We import commands and clients as needed.
+const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
 const axios = require('axios');
+const { simpleParser, MailParser } = require('mailparser');
 const EmailReplyParser = require("email-reply-parser");
 const TurndownService = require("turndown");
+
+const { getChannel, domainCredentials } = require("./mappers");
+
+// --- Initialization ---
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
 const turndownService = new TurndownService();
-const {getChannel} = require("./mappers");
-const simpleParser = require('mailparser').simpleParser;
-const MailParser = require('mailparser').MailParser;
+const mailParser = new MailParser();
+const s3AttachmentBucketName = process.env.S3_ATTACHMENT_BUCKET || 'fluentsupportinboundemail';
 
-const s3 = new AWS.S3({
-    apiVersion: '2006-03-01',
-    region: process.env.AWSREGION,
-});
+// --- Conditional Logging Helper ---
+// Checks the STAGE environment variable. Logs only appear if STAGE is 'dev'.
+const isDev = process.env.STAGE === 'dev';
+const logDev = (...args) => {
+    if (isDev) {
+        console.log(...args);
+    }
+};
 
-const s3AttachmentBucketName = 'your_unique_s3_file_bucket'; // create a S3 bucket and provide the name. This will be used to store the email attachment.
-
-function parseEmailTo(data) {
-    return data.value[0];
-}
-
-function getNow() {
-    const date = new Date();
-    return date.getFullYear() + '-' + (date.getMonth() + 1) + '-' + date.getDate() + ' ' + date.getHours() + ':' + date.getMinutes() + ':' + date.getSeconds();
+/**
+ * Extracts the primary 'to' address from the email data.
+ * @param {object} toData - The 'to' object from the parsed email.
+ * @returns {object} The first address object.
+ */
+function parseEmailTo(toData) {
+    logDev('Parsing "to" address from:', toData);
+    return toData?.value[0];
 }
 
 module.exports.postprocess = async (event) => {
+    logDev('Received event:', JSON.stringify(event, null, 2));
     const record = event.Records[0];
-    const request = {
-        Bucket: record.s3.bucket.name,
-        Key: record.s3.object.key,
-    };
+    const sourceBucket = record.s3.bucket.name;
+    const sourceKey = record.s3.object.key;
 
     try {
-        const data = await s3.getObject(request).promise();
-        // console.log('Raw email:' + data.Body);
-        const email = await simpleParser(data.Body);
+        // --- 1. Fetch and Parse Email from S3 ---
+        const getObjectCmd = new GetObjectCommand({
+            Bucket: sourceBucket,
+            Key: sourceKey,
+        });
+        const s3Object = await s3Client.send(getObjectCmd);
+        // SDK v3 streams the body; we need to convert it to a buffer for the parser.
+        const email = await simpleParser(s3Object.Body);
+
         const to = parseEmailTo(email.to);
-        const mimeName = record.s3.object.key;
+        if (!to?.address) {
+            // IMPROVED: This is a non-critical warning, not a system error.
+            console.log(`WARN: Could not determine a "to" address. Aborting.`, { sourceKey });
+            return;
+        }
 
+        // --- 2. Determine Webhook URL ---
         const webhookUrl = getChannel(to.address, email.headers.get('x-forwarded-to'));
-
         if (!webhookUrl) {
-            console.log('No Webhook URL found for email Mime: ' + mimeName + '; Email Address: ' + to.address);
-            return false; // Webhook URL could not be found from your mappers.js file
+            // IMPROVED: This is an expected outcome, not a system error.
+            console.log(`INFO: No Webhook URL found for email. Mime: ${sourceKey}; To: ${to.address}`);
+            return; // No configuration found, processing stops.
         }
 
-        const now = getNow();
-        let isMarkDown = false;
-
-        if (!email.text && email.html) {
-
-            const head = email.html.match(/<head>.*<\/head>/s);
-            if (head) {
-                email.html = email.html.replace(head[0], '');
-            }
-
-            email.text = turndownService.turndown(email.html);
-            isMarkDown = true;
+        // --- 3. Process Email Body ---
+        let visibleText;
+        if (email.html) {
+            // Strip the <head> tag to avoid CSS styles being converted to markdown
+            const cleanHtml = email.html.replace(/<head>.*<\/head>/s, '');
+            email.text = turndownService.turndown(cleanHtml);
         }
+        visibleText = new EmailReplyParser().read(email.text).getVisibleText();
 
-        const emailReplyParser = new EmailReplyParser().read(email.text);
-        let visibleText = emailReplyParser.getVisibleText();
-
-        // Handle Forwarded Message
-        const matches = visibleText.match(/From:.+?(?=To:)[^>]*>/sg);
+        // --- 4. Handle Forwarded Messages ---
         let forwarded = null;
-        if (matches) {
-            let forwardedParts = visibleText.match(/(?<=From:\s+)(.*?)(?=>)/);
-            if (forwardedParts) {
-                forwardedParts = forwardedParts[0].split('<');
-                forwarded = {
-                    name: forwardedParts[0].trim(),
-                    address: forwardedParts[1].trim()
-                };
-            }
-
-            matches.forEach(match => visibleText = visibleText.replace(match, ''));
+        const fwdMatches = visibleText.match(/(?<=From:\s+)(.*?)(?=>)/);
+        if (fwdMatches) {
+            const forwardedParts = fwdMatches[0].split('<');
+            forwarded = {
+                name: forwardedParts[0].trim(),
+                address: forwardedParts[1].trim()
+            };
+            // Clean up forwarding headers from the visible text
+            visibleText = visibleText.replace(/From:.+?(?=To:)[^>]*>/sg, '');
             visibleText = visibleText.replace(/---------- Forwarded message ---------/g, '');
         }
 
+        // --- 5. Process Attachments in Parallel ---
+        const attachmentUploadPromises = email.attachments.map(async (attachment) => {
+            const key = `${Date.now()}_${attachment.filename.replace(/\s/g, '_')}`;
+            const putCmd = new PutObjectCommand({
+                Bucket: s3AttachmentBucketName,
+                Key: key,
+                Body: attachment.content,
+                ContentType: attachment.contentType,
+            });
+            await s3Client.send(putCmd);
+
+            // Create a presigned URL for the attachment
+            const getCmd = new GetObjectCommand({ Bucket: s3AttachmentBucketName, Key: key });
+            const url = await getSignedUrl(s3Client, getCmd, { expiresIn: 3600 * 24 * 7 }); // 7-day expiry
+
+            return {
+                url,
+                cid: attachment.cid,
+                filename: attachment.filename,
+                contentType: attachment.contentType,
+                contentDisposition: attachment.contentDisposition,
+            };
+        });
+
+        const attachments = await Promise.all(attachmentUploadPromises);
+
+        // --- 6. Prepare and Send Payload ---
         const formattedData = {
             date: email.date,
             subject: email.subject,
-            body_text: (new MailParser()).textToHtml(visibleText),
+            body_text: mailParser.textToHtml(visibleText.trim()),
             messageId: email.messageId,
             from: email.from,
             to: email.to,
             forwarded,
-            attachments: [],
-            isMarkDown
+            attachments,
+            isMarkDown: !!email.html, // Set true if original email had HTML
         };
 
-        const processPayload = async _ => {
-            for (let i = 0; i < email.attachments.length; i++) {
-                const attachment = email.attachments[i];
-                const key = attachment.filename.split('.').join('_' + Date.now() + '.');
-
-                await s3.putObject({
-                    Bucket: s3AttachmentBucketName,
-                    Key: key,
-                    Body: attachment.content
-                }).promise();
-
-                await s3.getSignedUrlPromise('getObject', {
-                    Bucket: s3AttachmentBucketName,
-                    Key: key,
-                }).then(url => {
-                    formattedData.attachments.push({
-                        url,
-                        cid: attachment.cid,
-                        filename: attachment.filename,
-                        contentType: attachment.contentType,
-                        contentDisposition: attachment.contentDisposition,
-                    });
-                })
-            }
-
-            const postedData = JSON.stringify(formattedData);
-
-            await axios.post(webhookUrl, {payload: postedData})
-                .then((res) => {
-                    // it's a success
-                })
-                .catch((error) => {
-                    let log = {
-                        type: 'failed',
-                        payload: postedData,
-                        mime: record.s3.object.key,
-                        created_at: now,
-                        updated_at: now,
-                        id: channel.log_id,
-                    };
-
-
-
-                    if (error.response) {
-                        log.response_status = error.response.status;
-                        log.message = 'Probably plugin deactivated.';
-                    } else if (error.request) {
-                        log.response_status = 400;
-                        log.message = 'Domain not available.';
-                    } else {
-                        log.response_status = 500;
-                        log.message = 'Axios setup error.';
-                    }
-
-                    console.log(log);
-                })
-                .finally(() => {});
+        const postedData = JSON.stringify(formattedData);
+        const headers = {}; // A great place too additional headers, for example, to get around some firewall rules.
+        // Add the custom auth header ONLY if the environment variable is set
+        if (process.env.CUSTOM_AUTH_HEADER) {
+            headers[process.env.CUSTOM_AUTH_HEADER] = process.env.CUSTOM_AUTH_HEADER_VALUE;
         }
 
-        await processPayload();
+        try {
+            const domain = new URL(webhookUrl).hostname;
+            const auth = domainCredentials[domain];
+            if (auth?.username && auth?.password) {
+                const credentials = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+                headers['Authorization'] = `Basic ${credentials}`;
+                logDev(`Applying credentials for domain: ${domain}`);
+            } else {
+                logDev(`No credentials found for domain: ${domain}.`);
+            }
+        } catch (urlError) {
+            // This is a potential configuration error, so console.error is appropriate.
+            console.error('Could not parse domain from webhookUrl:', webhookUrl, urlError);
+        }
 
-    } catch (Error) {
-        console.log(Error, Error.stack);
-        return Error;
+        logDev(`Posting to webhook: ${webhookUrl}`);
+        await axios.post(webhookUrl, { payload: postedData }, { headers });
+        logDev(`Successfully posted to ${webhookUrl}`);
+
+    } catch (error) {
+        // This is a true error, so console.error is appropriate.
+        console.error('An unhandled error occurred in the postprocess handler:', {
+            errorMessage: error.message,
+            errorStack: error.stack,
+            s3ObjectKey: sourceKey,
+        });
+        // Re-throw the error to allow AWS Lambda to handle retries if configured
+        throw error;
     }
 };
+
+// Explicitly export the function for testing purposes
+module.exports.postprocess = module.exports.postprocess;
