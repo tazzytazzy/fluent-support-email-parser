@@ -4,7 +4,7 @@ and had no real documentation on how to implement it.
 
 ## What's changed from the original:
 - Usable documentation on how to use the code.
-- Proper testing usual actual configuration data.
+- Proper testing using actual configuration data.
 - Uses node version 22, upgrade 14.
 - Uses aws sdk 3. Make it much lighter which results in faster startup time, this makes it cheaper to use.
 - Handles multiple domains.
